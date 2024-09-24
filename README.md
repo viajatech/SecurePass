@@ -9,3 +9,19 @@ El script "SecurePass by Viaja Tech" implementa un sistema robusto para almacena
 ![](https://github.com/viajatech/SecurePass/blob/main/agregar%20entrada.png)
 --------
 ![](https://github.com/viajatech/SecurePass/blob/main/Generar%20Contrase%C3%B1a%20GUI.png)
+--------
+Seguridad de la Contraseña Maestra
+Hashing Seguro:
+La contraseña maestra no se almacena directamente. En su lugar, se guarda un hash SHA-256 de la contraseña, lo que añade una capa de seguridad.
+Verificación de Contraseña:
+Al iniciar sesión, la contraseña ingresada se hashée y se compara de manera segura (usando hmac.compare_digest) con el hash almacenado en lock_info.json.
+Autenticación Multifactorial (MFA)
+Configuración de 2FA:
+Si habilitas 2FA, se almacena un secreto TOTP (Time-based One-Time Password) en la tabla settings de la base de datos.
+Proceso de Autenticación:
+Al iniciar sesión, después de ingresar la contraseña maestra, se solicita un código OTP generado por una aplicación de autenticación (como Google Authenticator).
+Protección Contra Ataques de Fuerza Bruta
+Límites de Intentos:
+El script limita el número de intentos de inicio de sesión fallidos a 5.
+Bloqueo Temporal:
+Tras alcanzar el máximo de intentos fallidos, el acceso se bloquea durante 5 minutos para prevenir ataques de fuerza bruta.
