@@ -1,0 +1,672 @@
+#Por David Ruiz @viajatech 
+
+#pip install cryptography PyQt5 pyotp qrcode[pil] pillow
+
+import sys
+import os
+import json
+import base64
+import hashlib
+import hmac
+import sqlite3
+import pyperclip
+import pyotp
+import qrcode
+import io
+from PyQt5 import QtWidgets, QtGui, QtCore
+from cryptography.hazmat.primitives import hashes, padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.backends import default_backend
+
+# Constantes
+DB_NAME = 'securepass.db'
+LOCK_INFO_FILE = 'lock_info.json'
+MAX_LOGIN_ATTEMPTS = 5
+LOCKOUT_DURATION = 300  # En segundos (5 minutos)
+
+# Funciones de Cifrado y Descifrado
+def derive_key(password, salt):
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,  # AES-256
+        salt=salt,
+        iterations=200000,
+        backend=default_backend()
+    )
+    return kdf.derive(password.encode())
+
+def encrypt_data(plain_text, key):
+    iv = os.urandom(16)
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    encryptor = cipher.encryptor()
+    padder = padding.PKCS7(128).padder()
+    padded_data = padder.update(plain_text.encode()) + padder.finalize()
+    encrypted = encryptor.update(padded_data) + encryptor.finalize()
+    return base64.b64encode(iv + encrypted).decode()
+
+def decrypt_data(encrypted_text, key):
+    raw = base64.b64decode(encrypted_text)
+    iv = raw[:16]
+    encrypted = raw[16:]
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    decryptor = cipher.decryptor()
+    decrypted_padded = decryptor.update(encrypted) + decryptor.finalize()
+    unpadder = padding.PKCS7(128).unpadder()
+    decrypted = unpadder.update(decrypted_padded) + unpadder.finalize()
+    return decrypted.decode()
+
+# Función para comparar en tiempo constante
+def constant_time_compare(val1, val2):
+    return hmac.compare_digest(val1, val2)
+
+# Clase de la Aplicación de Inicio de Sesión
+class LoginWindow(QtWidgets.QWidget):
+    def __init__(self):
+        super().__init__()
+        self.attempts = 0
+        self.locked_until = None
+        self.initUI()
+
+    def initUI(self):
+        self.setWindowTitle('SecurePass by Viaja Tech - Inicio de Sesión')
+        self.setGeometry(100, 100, 400, 200)
+        
+        layout = QtWidgets.QVBoxLayout()
+
+        # Contraseña Maestra
+        self.pw_label = QtWidgets.QLabel('Contraseña Maestra:')
+        layout.addWidget(self.pw_label)
+        self.pw_input = QtWidgets.QLineEdit()
+        self.pw_input.setEchoMode(QtWidgets.QLineEdit.Password)
+        layout.addWidget(self.pw_input)
+
+        # Botón de Iniciar Sesión
+        self.login_button = QtWidgets.QPushButton('Iniciar Sesión')
+        self.login_button.clicked.connect(self.handle_login)
+        layout.addWidget(self.login_button)
+
+        # Configuración de 2FA
+        self.setup_2fa_button = QtWidgets.QPushButton('Configurar Autenticación de Dos Factores (2FA)')
+        self.setup_2fa_button.clicked.connect(self.setup_2fa)
+        layout.addWidget(self.setup_2fa_button)
+
+        self.setLayout(layout)
+
+    def handle_login(self):
+        if self.locked_until and QtCore.QTime.currentTime() < self.locked_until:
+            remaining = self.locked_until.secsTo(QtCore.QTime.currentTime())
+            QtWidgets.QMessageBox.warning(self, 'Bloqueado', f'Acceso bloqueado. Intenta nuevamente en {remaining} segundos.')
+            return
+
+        password = self.pw_input.text()
+        if not os.path.exists(DB_NAME):
+            QtWidgets.QMessageBox.warning(self, 'Error', 'No se ha configurado una contraseña maestra. Por favor, inicia la configuración.')
+            return
+
+        # Leer lock_info
+        with open(LOCK_INFO_FILE, 'r') as f:
+            lock_info = json.load(f)
+        salt = base64.b64decode(lock_info['salt'])
+        stored_password_hash = base64.b64decode(lock_info['password_hash'])
+
+        # Hash de la contraseña ingresada
+        entered_password_hash = hashlib.sha256(password.encode()).digest()
+
+        if not constant_time_compare(stored_password_hash, entered_password_hash):
+            self.attempts += 1
+            if self.attempts >= MAX_LOGIN_ATTEMPTS:
+                self.locked_until = QtCore.QTime.currentTime().addSecs(LOCKOUT_DURATION)
+                QtWidgets.QMessageBox.warning(self, 'Bloqueado', f'Máximos intentos alcanzados. Acceso bloqueado por {LOCKOUT_DURATION // 60} minutos.')
+            else:
+                QtWidgets.QMessageBox.warning(self, 'Error', f'Contraseña incorrecta. Intentos restantes: {MAX_LOGIN_ATTEMPTS - self.attempts}')
+            return
+
+        # Verificar si 2FA está habilitado
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT two_factor_secret FROM settings")
+        result = cursor.fetchone()
+        conn.close()
+
+        if result and result[0]:
+            self.twofa_window = TwoFAWindow(password, result[0])
+            self.twofa_window.show()
+            self.close()
+        else:
+            self.main_window = MainWindow(password)
+            self.main_window.show()
+            self.close()
+
+    def setup_2fa(self):
+        self.setup_window = Setup2FAWindow()
+        self.setup_window.show()
+
+# Clase para Configurar 2FA
+class Setup2FAWindow(QtWidgets.QWidget):
+    def __init__(self):
+        super().__init__()
+        self.initUI()
+
+    def initUI(self):
+        self.setWindowTitle('Configurar Autenticación de Dos Factores (2FA)')
+        self.setGeometry(150, 150, 400, 300)
+        
+        layout = QtWidgets.QVBoxLayout()
+
+        # Generar Secret
+        self.secret = pyotp.random_base32()
+        totp = pyotp.TOTP(self.secret)
+        otp_url = totp.provisioning_uri(name='SecurePass by Viaja Tech', issuer_name='SecurePass by Viaja Tech')
+
+        # Generar QR Code
+        qr = qrcode.QRCode(border=1)
+        qr.add_data(otp_url)
+        qr.make(fit=True)
+        img = qr.make_image(fill='black', back_color='white')
+        buf = io.BytesIO()
+        img.save(buf, format='PNG')
+        pixmap = QtGui.QPixmap()
+        pixmap.loadFromData(buf.getvalue())
+        self.qr_label = QtWidgets.QLabel()
+        self.qr_label.setPixmap(pixmap)
+        layout.addWidget(self.qr_label)
+
+        # Instrucciones
+        self.instr_label = QtWidgets.QLabel('Escanea el código QR con tu aplicación de autenticación (como Google Authenticator).')
+        layout.addWidget(self.instr_label)
+
+        # Código OTP
+        self.otp_input = QtWidgets.QLineEdit()
+        self.otp_input.setPlaceholderText('Ingresa el código OTP generado')
+        layout.addWidget(self.otp_input)
+
+        # Botón de Verificar
+        self.verify_button = QtWidgets.QPushButton('Verificar y Guardar 2FA')
+        self.verify_button.clicked.connect(self.verify_otp)
+        layout.addWidget(self.verify_button)
+
+        self.setLayout(layout)
+
+    def verify_otp(self):
+        otp = self.otp_input.text()
+        totp = pyotp.TOTP(self.secret)
+        if totp.verify(otp):
+            # Guardar en la base de datos
+            conn = sqlite3.connect(DB_NAME)
+            cursor = conn.cursor()
+            cursor.execute("CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, two_factor_secret TEXT)")
+            cursor.execute("INSERT INTO settings (two_factor_secret) VALUES (?)", (self.secret,))
+            conn.commit()
+            conn.close()
+            QtWidgets.QMessageBox.information(self, 'Éxito', 'Autenticación de Dos Factores configurada exitosamente.')
+            self.close()
+        else:
+            QtWidgets.QMessageBox.warning(self, 'Error', 'Código OTP incorrecto. Inténtalo nuevamente.')
+
+# Clase para Ventana de Verificación de 2FA
+class TwoFAWindow(QtWidgets.QWidget):
+    def __init__(self, password, secret):
+        super().__init__()
+        self.password = password
+        self.secret = secret
+        self.initUI()
+
+    def initUI(self):
+        self.setWindowTitle('Verificar Autenticación de Dos Factores (2FA)')
+        self.setGeometry(200, 200, 400, 200)
+        
+        layout = QtWidgets.QVBoxLayout()
+
+        self.otp_label = QtWidgets.QLabel('Ingresa el código OTP de tu aplicación de autenticación:')
+        layout.addWidget(self.otp_label)
+        self.otp_input = QtWidgets.QLineEdit()
+        self.otp_input.setPlaceholderText('Código OTP')
+        layout.addWidget(self.otp_input)
+
+        self.verify_button = QtWidgets.QPushButton('Verificar')
+        self.verify_button.clicked.connect(self.verify_code)
+        layout.addWidget(self.verify_button)
+
+        self.setLayout(layout)
+
+    def verify_code(self):
+        otp = self.otp_input.text()
+        totp = pyotp.TOTP(self.secret)
+        if totp.verify(otp):
+            self.main_window = MainWindow(self.password)
+            self.main_window.show()
+            self.close()
+        else:
+            QtWidgets.QMessageBox.warning(self, 'Error', 'Código OTP incorrecto. Inténtalo nuevamente.')
+
+# Clase de la Ventana Principal
+class MainWindow(QtWidgets.QWidget):
+    def __init__(self, password):
+        super().__init__()
+        self.password = password
+        self.initUI()
+        self.connect_db()
+        self.load_entries()
+
+    def initUI(self):
+        self.setWindowTitle('SecurePass by Viaja Tech')
+        self.setGeometry(100, 100, 800, 600)
+        
+        layout = QtWidgets.QVBoxLayout()
+
+        # Tabla de Contraseñas
+        self.table = QtWidgets.QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(['Sitio', 'Usuario', 'Contraseña', 'Notas'])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        layout.addWidget(self.table)
+
+        # Botones
+        button_layout = QtWidgets.QHBoxLayout()
+        
+        self.add_button = QtWidgets.QPushButton('Agregar')
+        self.add_button.clicked.connect(self.add_entry)
+        button_layout.addWidget(self.add_button)
+        
+        self.edit_button = QtWidgets.QPushButton('Editar')
+        self.edit_button.clicked.connect(self.edit_entry)
+        button_layout.addWidget(self.edit_button)
+        
+        self.delete_button = QtWidgets.QPushButton('Eliminar')
+        self.delete_button.clicked.connect(self.delete_entry)
+        button_layout.addWidget(self.delete_button)
+        
+        self.generate_button = QtWidgets.QPushButton('Generar Contraseña')
+        self.generate_button.clicked.connect(self.generate_password)
+        button_layout.addWidget(self.generate_button)
+        
+        self.copy_button = QtWidgets.QPushButton('Copiar Contraseña')
+        self.copy_button.clicked.connect(self.copy_password)
+        button_layout.addWidget(self.copy_button)
+        
+        layout.addLayout(button_layout)
+
+        self.setLayout(layout)
+
+    def connect_db(self):
+        self.conn = sqlite3.connect(DB_NAME)
+        self.cursor = self.conn.cursor()
+        # Crear tabla si no existe
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS passwords (
+                id INTEGER PRIMARY KEY,
+                site TEXT NOT NULL,
+                username TEXT NOT NULL,
+                password TEXT NOT NULL,
+                notes TEXT
+            )
+        ''')
+        self.conn.commit()
+
+        # Obtener la clave de cifrado
+        with open(LOCK_INFO_FILE, 'r') as f:
+            lock_info = json.load(f)
+        salt = base64.b64decode(lock_info['salt'])
+        self.key = derive_key(self.password, salt)
+
+    def load_entries(self):
+        self.cursor.execute("SELECT * FROM passwords")
+        records = self.cursor.fetchall()
+        self.table.setRowCount(0)
+        for row_number, row_data in enumerate(records):
+            self.table.insertRow(row_number)
+            site = row_data[1]
+            username = row_data[2]
+            encrypted_password = row_data[3]
+            notes = row_data[4]
+
+            # Desencriptar la contraseña
+            try:
+                password = decrypt_data(encrypted_password, self.key)
+            except Exception as e:
+                password = "Error de Descifrado"
+
+            self.table.setItem(row_number, 0, QtWidgets.QTableWidgetItem(site))
+            self.table.setItem(row_number, 1, QtWidgets.QTableWidgetItem(username))
+            self.table.setItem(row_number, 2, QtWidgets.QTableWidgetItem(password))
+            self.table.setItem(row_number, 3, QtWidgets.QTableWidgetItem(notes))
+
+    def add_entry(self):
+        self.entry_window = EntryWindow(self.key)
+        self.entry_window.show()
+        self.entry_window.saved.connect(self.load_entries)
+
+    def edit_entry(self):
+        selected = self.table.currentRow()
+        if selected < 0:
+            QtWidgets.QMessageBox.warning(self, 'Error', 'Por favor, selecciona una entrada para editar.')
+            return
+        site = self.table.item(selected, 0).text()
+        username = self.table.item(selected, 1).text()
+        password = self.table.item(selected, 2).text()
+        notes = self.table.item(selected, 3).text()
+
+        self.entry_window = EntryWindow(self.key, site, username, password, notes, edit=True, entry_id=self.get_entry_id(site, username))
+        self.entry_window.show()
+        self.entry_window.saved.connect(self.load_entries)
+
+    def get_entry_id(self, site, username):
+        self.cursor.execute("SELECT id FROM passwords WHERE site=? AND username=?", (site, username))
+        result = self.cursor.fetchone()
+        if result:
+            return result[0]
+        return None
+
+    def delete_entry(self):
+        selected = self.table.currentRow()
+        if selected < 0:
+            QtWidgets.QMessageBox.warning(self, 'Error', 'Por favor, selecciona una entrada para eliminar.')
+            return
+        site = self.table.item(selected, 0).text()
+        username = self.table.item(selected, 1).text()
+        confirm = QtWidgets.QMessageBox.question(self, 'Confirmar Eliminación', f'¿Estás seguro de eliminar la entrada para "{site}"?')
+        if confirm == QtWidgets.QMessageBox.Yes:
+            entry_id = self.get_entry_id(site, username)
+            if entry_id:
+                self.cursor.execute("DELETE FROM passwords WHERE id=?", (entry_id,))
+                self.conn.commit()
+                self.load_entries()
+                QtWidgets.QMessageBox.information(self, 'Éxito', 'Entrada eliminada exitosamente.')
+
+    def generate_password(self):
+        self.gen_window = PasswordGeneratorWindow()
+        self.gen_window.password_generated.connect(self.set_generated_password)
+        self.gen_window.show()
+
+    def set_generated_password(self, password):
+        # Aquí podrías asignar la contraseña generada a un campo específico
+        pass
+
+    def copy_password(self):
+        selected = self.table.currentRow()
+        if selected < 0:
+            QtWidgets.QMessageBox.warning(self, 'Error', 'Por favor, selecciona una entrada para copiar la contraseña.')
+            return
+        password = self.table.item(selected, 2).text()
+        pyperclip.copy(password)
+        QtWidgets.QMessageBox.information(self, 'Éxito', 'Contraseña copiada al portapapeles.')
+
+# Clase para Agregar/Editar Entradas
+class EntryWindow(QtWidgets.QWidget):
+    saved = QtCore.pyqtSignal()
+
+    def __init__(self, key, site='', username='', password='', notes='', edit=False, entry_id=None):
+        super().__init__()
+        self.key = key
+        self.edit = edit
+        self.entry_id = entry_id
+        self.initUI(site, username, password, notes)
+
+    def initUI(self, site, username, password, notes):
+        self.setWindowTitle('Editar Entrada' if self.edit else 'Agregar Entrada')
+        self.setGeometry(150, 150, 400, 300)
+        
+        layout = QtWidgets.QFormLayout()
+
+        self.site_input = QtWidgets.QLineEdit(site)
+        layout.addRow('Sitio:', self.site_input)
+
+        self.username_input = QtWidgets.QLineEdit(username)
+        layout.addRow('Usuario:', self.username_input)
+
+        self.password_input = QtWidgets.QLineEdit(password)
+        layout.addRow('Contraseña:', self.password_input)
+
+        self.notes_input = QtWidgets.QTextEdit(notes)
+        layout.addRow('Notas:', self.notes_input)
+
+        # Botones
+        button_layout = QtWidgets.QHBoxLayout()
+        self.save_button = QtWidgets.QPushButton('Guardar')
+        self.save_button.clicked.connect(self.save_entry)
+        self.cancel_button = QtWidgets.QPushButton('Cancelar')
+        self.cancel_button.clicked.connect(self.close)
+        button_layout.addWidget(self.save_button)
+        button_layout.addWidget(self.cancel_button)
+
+        layout.addRow(button_layout)
+
+        self.setLayout(layout)
+
+    def save_entry(self):
+        site = self.site_input.text()
+        username = self.username_input.text()
+        password = self.password_input.text()
+        notes = self.notes_input.toPlainText()
+
+        if not site or not username or not password:
+            QtWidgets.QMessageBox.warning(self, 'Error', 'Por favor, completa todos los campos obligatorios.')
+            return
+
+        encrypted_password = encrypt_data(password, self.key)
+
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        if self.edit and self.entry_id:
+            cursor.execute('''
+                UPDATE passwords
+                SET site=?, username=?, password=?, notes=?
+                WHERE id=?
+            ''', (site, username, encrypted_password, notes, self.entry_id))
+        else:
+            cursor.execute('''
+                INSERT INTO passwords (site, username, password, notes)
+                VALUES (?, ?, ?, ?)
+            ''', (site, username, encrypted_password, notes))
+        conn.commit()
+        conn.close()
+
+        self.saved.emit()
+        self.close()
+        QtWidgets.QMessageBox.information(self, 'Éxito', 'Entrada guardada exitosamente.')
+
+# Clase para Generador de Contraseñas
+class PasswordGeneratorWindow(QtWidgets.QWidget):
+    password_generated = QtCore.pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.initUI()
+
+    def initUI(self):
+        self.setWindowTitle('Generador de Contraseñas')
+        self.setGeometry(200, 200, 400, 300)
+        
+        layout = QtWidgets.QVBoxLayout()
+
+        # Longitud de la Contraseña
+        self.length_label = QtWidgets.QLabel('Longitud de la contraseña:')
+        layout.addWidget(self.length_label)
+        self.length_input = QtWidgets.QSpinBox()
+        self.length_input.setRange(8, 32)
+        self.length_input.setValue(16)
+        layout.addWidget(self.length_input)
+
+        # Opciones de Complejidad
+        self.uppercase = QtWidgets.QCheckBox('Incluir letras mayúsculas')
+        self.uppercase.setChecked(True)
+        layout.addWidget(self.uppercase)
+
+        self.lowercase = QtWidgets.QCheckBox('Incluir letras minúsculas')
+        self.lowercase.setChecked(True)
+        layout.addWidget(self.lowercase)
+
+        self.digits = QtWidgets.QCheckBox('Incluir dígitos')
+        self.digits.setChecked(True)
+        layout.addWidget(self.digits)
+
+        self.special = QtWidgets.QCheckBox('Incluir caracteres especiales')
+        self.special.setChecked(True)
+        layout.addWidget(self.special)
+
+        # Botón para Generar
+        self.generate_button = QtWidgets.QPushButton('Generar Contraseña')
+        self.generate_button.clicked.connect(self.generate_password)
+        layout.addWidget(self.generate_button)
+
+        # Campo para Mostrar la Contraseña Generada
+        self.password_display = QtWidgets.QLineEdit()
+        self.password_display.setReadOnly(True)
+        layout.addWidget(self.password_display)
+
+        # Botón para Copiar al Portapapeles
+        self.copy_button = QtWidgets.QPushButton('Copiar al Portapapeles')
+        self.copy_button.clicked.connect(self.copy_password)
+        layout.addWidget(self.copy_button)
+
+        self.setLayout(layout)
+
+    def generate_password(self):
+        import string
+        import random
+
+        length = self.length_input.value()
+        characters = ''
+        if self.uppercase.isChecked():
+            characters += string.ascii_uppercase
+        if self.lowercase.isChecked():
+            characters += string.ascii_lowercase
+        if self.digits.isChecked():
+            characters += string.digits
+        if self.special.isChecked():
+            characters += string.punctuation
+
+        if not characters:
+            QtWidgets.QMessageBox.warning(self, 'Error', 'Selecciona al menos una opción de complejidad.')
+            return
+
+        password = ''.join(random.choice(characters) for _ in range(length))
+        self.password_display.setText(password)
+        self.password_generated.emit(password)
+        QtWidgets.QMessageBox.information(self, 'Contraseña Generada', 'La contraseña ha sido generada y copiada al portapapeles.')
+        pyperclip.copy(password)
+
+    def copy_password(self):
+        password = self.password_display.text()
+        if password:
+            pyperclip.copy(password)
+            QtWidgets.QMessageBox.information(self, 'Éxito', 'Contraseña copiada al portapapeles.')
+        else:
+            QtWidgets.QMessageBox.warning(self, 'Error', 'No hay ninguna contraseña para copiar.')
+
+# Clase para Configurar la Contraseña Maestra (Primera Ejecución)
+class SetupWindow(QtWidgets.QWidget):
+    def __init__(self):
+        super().__init__()
+        self.initUI()
+
+    def initUI(self):
+        self.setWindowTitle('SecurePass by Viaja Tech - Configuración Inicial')
+        self.setGeometry(150, 150, 400, 250)
+        
+        layout = QtWidgets.QVBoxLayout()
+
+        # Instrucciones
+        self.instr_label = QtWidgets.QLabel('Configura tu contraseña maestra:')
+        layout.addWidget(self.instr_label)
+
+        # Contraseña Maestra
+        self.pw_label = QtWidgets.QLabel('Contraseña Maestra:')
+        layout.addWidget(self.pw_label)
+        self.pw_input = QtWidgets.QLineEdit()
+        self.pw_input.setEchoMode(QtWidgets.QLineEdit.Password)
+        layout.addWidget(self.pw_input)
+
+        # Confirmar Contraseña
+        self.confirm_pw_label = QtWidgets.QLabel('Confirma tu Contraseña Maestra:')
+        layout.addWidget(self.confirm_pw_label)
+        self.confirm_pw_input = QtWidgets.QLineEdit()
+        self.confirm_pw_input.setEchoMode(QtWidgets.QLineEdit.Password)
+        layout.addWidget(self.confirm_pw_input)
+
+        # Botón de Configuración
+        self.setup_button = QtWidgets.QPushButton('Configurar Contraseña')
+        self.setup_button.clicked.connect(self.setup_master_password)
+        layout.addWidget(self.setup_button)
+
+        self.setLayout(layout)
+
+    def setup_master_password(self):
+        password = self.pw_input.text()
+        confirm_password = self.confirm_pw_input.text()
+
+        if not password or not confirm_password:
+            QtWidgets.QMessageBox.warning(self, 'Error', 'Por favor, completa todos los campos.')
+            return
+
+        if password != confirm_password:
+            QtWidgets.QMessageBox.warning(self, 'Error', 'Las contraseñas no coinciden.')
+            return
+
+        salt = os.urandom(16)
+        password_hash = hashlib.sha256(password.encode()).digest()
+        lock_info = {
+            'salt': base64.b64encode(salt).decode(),
+            'password_hash': base64.b64encode(password_hash).decode()
+        }
+
+        with open(LOCK_INFO_FILE, 'w') as f:
+            json.dump(lock_info, f)
+
+        # Cifrar la base de datos SQLite
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS passwords (
+                id INTEGER PRIMARY KEY,
+                site TEXT NOT NULL,
+                username TEXT NOT NULL,
+                password TEXT NOT NULL,
+                notes TEXT
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS settings (
+                id INTEGER PRIMARY KEY,
+                two_factor_secret TEXT
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id INTEGER PRIMARY KEY,
+                action TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        conn.commit()
+        conn.close()
+
+        QtWidgets.QMessageBox.information(self, 'Éxito', 'Contraseña maestra configurada exitosamente.')
+        self.close()
+        self.login_window = LoginWindow()
+        self.login_window.show()
+
+# Clase para Configurar y Mostrar la Aplicación
+class SecurePassApp:
+    def __init__(self):
+        if not os.path.exists(DB_NAME) or not os.path.exists(LOCK_INFO_FILE):
+            self.setup_window = SetupWindow()
+            self.setup_window.show()
+        else:
+            self.login_window = LoginWindow()
+            self.login_window.show()
+
+# Función principal
+def main():
+    app = QtWidgets.QApplication(sys.argv)
+    secure_pass_app = SecurePassApp()
+    sys.exit(app.exec_())
+
+if __name__ == '__main__':
+    main()
+
+
+
