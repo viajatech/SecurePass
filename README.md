@@ -25,3 +25,27 @@ Límites de Intentos:
 El script limita el número de intentos de inicio de sesión fallidos a 5.
 Bloqueo Temporal:
 Tras alcanzar el máximo de intentos fallidos, el acceso se bloquea durante 5 minutos para prevenir ataques de fuerza bruta.
+ Las contraseñas se cifran utilizando el algoritmo AES-256 en modo CBC (Cipher Block Chaining).
+Derivación de Clave:
+PBKDF2HMAC: Se utiliza para derivar una clave de cifrado a partir de la contraseña maestra proporcionada por el usuario.
+Sal y Iteraciones: Se emplea una sal aleatoria y 200,000 iteraciones para incrementar la seguridad contra ataques de fuerza bruta.
+Proceso de Cifrado:
+Generación de la Clave: A partir de la contraseña maestra y una sal almacenada en lock_info.json.
+Cifrado de la Contraseña: La contraseña ingresada se cifra usando AES-CBC con un IV (Vector de Inicialización) aleatorio.
+Almacenamiento: La contraseña cifrada se codifica en Base64 y se guarda en el campo password de la tabla passwords.
+2. Archivo de Información de Bloqueo (lock_info.json)
+Ubicación:
+
+Se encuentra en el mismo directorio que el script de Python.
+Contenido:
+
+salt: La sal utilizada para derivar la clave de cifrado a partir de la contraseña maestra.
+password_hash: El hash SHA-256 de la contraseña maestra para verificar su validez durante el inicio de sesión.
+Protección del Archivo:
+
+Ocultación del Archivo:
+Windows: Se utiliza el comando attrib +h para ocultar el archivo.
+Linux/macOS: Se renombra agregando un punto (.) al inicio del nombre del archivo, lo que lo hace oculto en la mayoría de los exploradores de archivos.
+Importancia de la Sal y el Hash:
+La sal es esencial para derivar la clave de cifrado de manera segura.
+El hash de la contraseña maestra se utiliza para autenticar al usuario sin almacenar la contraseña en texto plano.
