@@ -5,3 +5,5 @@
 ![](https://github.com/viajatech/SecurePass/blob/main/verificar%20QR%20.png)
 --------
 ![](https://github.com/viajatech/SecurePass/blob/main/agregar%20entrada.png)
+--------
+![](https://github.com/viajatech/SecurePass/blob/main/Generar%20Contrase%C3%B1a%20GUI.png)
